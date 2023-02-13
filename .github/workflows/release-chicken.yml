@@ -1,0 +1,148 @@
+# TODO: Make tests optional
+#       Abstract install into action(s)
+#       Cache not working between runs, tied to refs/tags version
+#       Mark as prerelease if tag contains -pre
+#       Maybe install in toolcache instead?
+
+# Known to work:
+#  5.0.0 - 5.3.0
+#  4.13.0
+# Known not to work:
+#  4.8.0.6 -- Failed make check, invalid escape sequence in embedded null test
+
+name: Publish Chicken versions
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    # We must create a release before other jobs run in parallel. Although
+    # upload-release-action checks for an existing release before trying to create
+    # one (which would fail), there is a race condition between checking and creating.
+    # Use this opportunity to download and cache the Chicken tarball, which we will use
+    # several times, and upload the tarball to our release.  Since the tarball is in
+    # our release, we might download the asset instead of caching it; for now, caching
+    # speeds up our workflow testing.
+    name: Create release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get version from tag
+        # Strip off v-prefix. Also strip off any - suffix for release testing.
+        run: |
+          VER=${GITHUB_REF_NAME#v}
+          VER=${VER%%-*}
+          echo "CHICKEN_VERSION=$VER" >> $GITHUB_ENV
+
+      - name: Download Chicken
+        run: |
+          CHICKEN_VERSION_DIR=$(echo $CHICKEN_VERSION | cut -d. -f1-3)
+          wget https://code.call-cc.org/releases/${CHICKEN_VERSION_DIR}/chicken-${CHICKEN_VERSION}.tar.gz
+          # This will match the file of the same name upstream.
+          sha256sum chicken-${CHICKEN_VERSION}.tar.gz > chicken-${CHICKEN_VERSION}.tar.gz.sha256
+
+      - name: Create release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          # file: parameter is required. If you have nothing to upload, use /dev/null
+          # and GitHub will ignore the upload.
+          file: chicken-${{ env.CHICKEN_VERSION }}.tar.gz*
+          file_glob: true
+          prerelease: "${{ contains(github.ref_name, '-pre') }}"
+          overwrite: true
+          body: "Chicken ${{ env.CHICKEN_VERSION }}"
+
+  build:
+    name: Publish for ${{ matrix.os }}
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            asset_id: ubuntu-22.04-x64
+          - os: ubuntu-20.04
+            asset_id: ubuntu-20.04-x64
+    steps:
+      - uses: actions/checkout@v3
+      - name: Get version from tag
+        # Strip off v-prefix. Also strip off any - suffix for release testing.
+        run: |
+          VER=${GITHUB_REF_NAME#v}
+          VER=${VER%%-*}
+          echo "CHICKEN_VERSION=$VER" >> $GITHUB_ENV
+
+      # build chicken
+
+      - name: Set environment variables
+        # PREFIX should be an absolute path.
+        run: |
+          echo "CHICKEN_PREFIX=$HOME/.local/chicken/$CHICKEN_VERSION" >> $GITHUB_ENV
+
+      - name: Restore Chicken toolchain
+        id: restore-chicken
+        uses: actions/cache/restore@v3
+        with:
+          path: ${{ env.CHICKEN_PREFIX }}
+          key: chicken-toolchain-${{ env.CHICKEN_VERSION }}-${{ matrix.asset_id }}
+
+      - name: Download Chicken tarball
+        # Plain curl would probably work fine.
+        uses: dsaltares/fetch-gh-release-asset@1.1.0
+        with:
+          version: tags/${{ github.ref_name }}
+          file: chicken-${{ env.CHICKEN_VERSION }}.tar.gz
+        if: steps.restore-chicken.outputs.cache-hit != 'true'
+
+      # FIXME: Should install into DESTDIR if we want to install into
+      # a shared dir; however, this precludes caching.
+      - name: Build Chicken
+        run: |
+          SRC=$HOME/src
+          mkdir -p $SRC
+          ls -l chicken-${CHICKEN_VERSION}.tar.gz
+          tar -C $SRC -zxf chicken-${CHICKEN_VERSION}.tar.gz
+          cd $SRC/chicken-${CHICKEN_VERSION}
+          # Chicken < 5.3.0 does not support parallel make
+          case ${CHICKEN_VERSION} in
+            5.[3-9].*) NPROC=$(nproc) ;;
+            *) NPROC=1 ;;
+          esac
+          make -j$NPROC PLATFORM=linux PREFIX=${CHICKEN_PREFIX}
+          make PLATFORM=linux PREFIX=${CHICKEN_PREFIX} install
+
+          ${CHICKEN_PREFIX}/bin/csi -version
+          cd -
+          tar zcvf chicken-toolchain-${CHICKEN_VERSION}.tar.gz ${CHICKEN_PREFIX}
+        if: steps.restore-chicken.outputs.cache-hit != 'true'
+
+      - name: Test Chicken
+        run: |
+          SRC=$HOME/src
+          cd $SRC/chicken-${CHICKEN_VERSION}
+          make PLATFORM=linux PREFIX=${CHICKEN_PREFIX} check
+        if: steps.restore-chicken.outputs.cache-hit != 'true'
+
+      # In production, we don't need to cache the built compiler. That's only
+      # needed if we are using it in further CI.
+      - name: Save Chicken toolchain
+        id: save-chicken
+        uses: actions/cache/save@v3
+        with:
+          path: ${{ env.CHICKEN_PREFIX }}
+          key: chicken-toolchain-${{ env.CHICKEN_VERSION }}-${{ matrix.asset_id }}
+        if: steps.restore-chicken.outputs.cache-hit != 'true'
+
+      # upload chicken
+
+      - name: Upload file to release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          file: chicken-toolchain-${{ env.CHICKEN_VERSION }}.tar.gz
+          asset_name: chicken-${{ env.CHICKEN_VERSION }}-${{ matrix.asset_id }}.tar.gz
+          overwrite: true
